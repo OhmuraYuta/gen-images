@@ -1,0 +1,36 @@
+services:
+  web:
+    build:
+      context: ./web
+      dockerfile: ../docker/web/Dockerfile
+    ports:
+      - "8000:80"
+    volumes:
+      - ./web:/var/www/html
+      - ./shared/images:/var/www/html/storage/app/public/generated
+    environment:
+      - APP_ENV=local
+      - APP_KEY=base64:$(php artisan key:generate --show)
+      - AI_ENGINE_URL=http://ai:8000
+    depends_on:
+      - ai
+
+  ai:
+    build:
+      context: ./ai
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./ai:/app
+      - ./shared/images:/app/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+networks:
+  default:
+    name: gen-images-network
