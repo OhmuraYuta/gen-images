@@ -28,6 +28,7 @@ new class extends Component
     // Face ID
     public $faceImage;
     public ?string $faceImageBase64 = null;
+    public float $faceStrength = 0.7;
 
     public function updatedFaceImage()
     {
@@ -39,6 +40,22 @@ new class extends Component
     {
         $this->faceImage = null;
         $this->faceImageBase64 = null;
+    }
+
+    // Pose Control
+    public $poseImage;
+    public ?string $poseImageBase64 = null;
+
+    public function updatedPoseImage()
+    {
+        $this->validate(['poseImage' => 'image|max:5120']);
+        $this->poseImageBase64 = 'data:image/png;base64,' . base64_encode(file_get_contents($this->poseImage->getRealPath()));
+    }
+    
+    public function clearPoseImage()
+    {
+        $this->poseImage = null;
+        $this->poseImageBase64 = null;
     }
 
     public function generate()
@@ -67,6 +84,8 @@ new class extends Component
                 'height' => $this->height,
                 'seed' => $this->isRandomSeed ? -1 : $this->seed,
                 'face_image' => $this->faceImageBase64,
+                'face_strength' => $this->faceStrength,
+                'pose_image' => $this->poseImageBase64,
             ]);
 
             if ($response->successful()) {
@@ -160,6 +179,65 @@ new class extends Component
                     </label>
                 @endif
                 <div wire:loading wire:target="faceImage" class="absolute inset-0 bg-white/80 dark:bg-black/80 flex items-center justify-center">
+                    <div class="w-4 h-4 border-2 border-[#f53003] border-t-transparent rounded-full animate-spin"></div>
+                </div>
+            </div>
+            
+            @if($faceImageBase64)
+                <div class="mt-4 pt-4 border-t border-[#19140010] dark:border-[#3E3E3A50]">
+                    <div class="flex items-center justify-between mb-2">
+                        <label class="text-xs font-bold uppercase tracking-wider opacity-60">Face Similarity ({{ $faceStrength }})</label>
+                    </div>
+                    <div>
+                        <input type="range" wire:model.live="faceStrength" min="0.0" max="1.0" step="0.05" class="w-full accent-[#f53003]">
+                        <div class="flex justify-between text-[10px] opacity-40 mt-1">
+                            <span>Subtle</span>
+                            <span>Strong</span>
+                        </div>
+                    </div>
+                </div>
+            @endif
+        </div>
+
+        <!-- Pose Control Section -->
+        <div class="space-y-3 pt-6 border-t border-[#19140010] dark:border-[#3E3E3A50]">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <div class="p-1.5 rounded-lg bg-[#f53003]/10 text-[#f53003]">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
+                        </svg>
+                    </div>
+                    <h3 class="font-bold text-sm tracking-wide">Pose Control</h3>
+                </div>
+                @if($poseImageBase64)
+                    <button wire:click="clearPoseImage" class="text-[10px] text-[#f53003] hover:underline">削除</button>
+                @endif
+            </div>
+
+            <div class="relative group">
+                @if($poseImageBase64)
+                    <div class="relative aspect-square rounded-2xl overflow-hidden border border-[#19140010] dark:border-[#3E3E3A50]">
+                        <img src="{{ $poseImageBase64 }}" class="w-full h-full object-cover">
+                        <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                            <button wire:click="clearPoseImage" class="px-3 py-1 bg-white/20 backdrop-blur text-white text-xs rounded-full hover:bg-white/30 transition-colors">変更する</button>
+                        </div>
+                    </div>
+                @else
+                    <label class="flex items-center gap-4 p-3 cursor-pointer">
+                        <input type="file" wire:model="poseImage" class="hidden" accept="image/*">
+                        <div class="w-12 h-12 rounded-lg bg-[#dbdbd7] dark:bg-[#161615] flex items-center justify-center border border-[#19140020]">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6 opacity-30">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
+                            </svg>
+                        </div>
+                        <div class="flex flex-col">
+                            <p class="text-[10px] font-bold uppercase tracking-wider opacity-60">Pose Control (ポーズ指定)</p>
+                            <p class="text-xs opacity-40">ポーズの参考画像をアップロード</p>
+                        </div>
+                    </label>
+                @endif
+                <div wire:loading wire:target="poseImage" class="absolute inset-0 bg-white/80 dark:bg-black/80 flex items-center justify-center">
                     <div class="w-4 h-4 border-2 border-[#f53003] border-t-transparent rounded-full animate-spin"></div>
                 </div>
             </div>

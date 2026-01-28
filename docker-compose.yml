@@ -10,7 +10,7 @@ services:
       - ./shared/images:/var/www/html/storage/app/public/generated
     environment:
       - APP_ENV=local
-      - APP_URL=http://100.103.177.31:8002
+      - APP_URL=http://localhost:8002
       - APP_KEY=base64:$(php artisan key:generate --show)
       - AI_ENGINE_URL=http://ai:8000
     depends_on:

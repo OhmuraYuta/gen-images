@@ -21,9 +21,17 @@ from insightface.app import FaceAnalysis
 from insightface.utils import face_align
 from huggingface_hub import hf_hub_download
 from transformers import CLIPVisionModelWithProjection
+from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel, StableDiffusionXLPipeline
+from controlnet_aux import OpenposeDetector
 from PIL import Image
 
 app = FastAPI()
+
+# グローバル変数
+pipe = None
+genai_client = None
+face_app = None
+openpose_detector = None # Lazy load
 
 # モデルのロード
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -38,16 +46,38 @@ try:
     if gemini_api_key:
         genai_client = genai.Client(api_key=gemini_api_key)
         print("Gemini API client initialized")
-    else:
         genai_client = None
         print("Warning: GEMINI_API_KEY not found. Gemini-based translation will be unavailable.")
 
-    # SDXL Pipeline をロード (安全フィルターを無効化)
-    pipe = StableDiffusionXLPipeline.from_pretrained(
+    # Lazy Load OpenPose
+    def get_openpose():
+        global openpose_detector
+        if openpose_detector is None:
+            print("Initializing OpenPose Detector (Lazy Load)...")
+            try:
+                openpose_detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+            except Exception as e:
+                print(f"Error loading OpenPose: {e}")
+                return None
+        return openpose_detector
+
+    # ControlNet OpenPose のロード
+    print("Loading ControlNet OpenPose (SDXL)...")
+    controlnet = ControlNetModel.from_pretrained(
+        "xinsir/controlnet-openpose-sdxl-1.0",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
+    # controlnet = None
+
+    # SDXL Pipeline (ControlNet) をロード
+    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
         model_id, 
+        controlnet=controlnet,
         torch_dtype=torch.float16, 
         variant="fp16", 
         use_safetensors=True,
+        low_cpu_mem_usage=True,
         safety_checker=None,
         requires_safety_checker=False
     )
@@ -56,6 +86,7 @@ try:
 except Exception as e:
     print(f"Error loading model: {e}")
     pipe = None
+    controlnet = None
     genai_client = None
 
 # InsightFace の初期化
@@ -83,7 +114,7 @@ try:
         ).to(device)
         
         # Image Encoder をパイプラインに登録し、CPU Offload の管理対象にする
-        pipe.register_modules(image_encoder=image_encoder)
+        pipe.register_modules(image_encoder=image_encoder, controlnet=controlnet)
 
         # 2. Load IP-Adapter for SDXL (ViT-H version)
         # ViT-H エンコーダーに対応した重みを使用します
@@ -121,6 +152,8 @@ class GenerateRequest(BaseModel):
     height: int = 1024
     seed: Optional[int] = -1
     face_image: Optional[str] = None # Base64 encoded image
+    face_strength: float = 0.7 # IP-Adapter scale (0.0 - 1.0)
+    pose_image: Optional[str] = None # Base64 encoded pose reference image
 
 @app.get("/health")
 def health():
@@ -210,6 +243,34 @@ async def generate(request: GenerateRequest):
                 print(f"Error processing face image: {e}")
                 traceback.print_exc()
 
+        # ポーズ画像の処理
+        pose_map = None
+        control_scale = 0.0
+        # Lazy Load function call
+        detector = get_openpose()
+        
+        if request.pose_image and detector is not None:
+            try:
+                # Base64デコード
+                header_p, encoded_p = request.pose_image.split(",", 1) if "," in request.pose_image else (None, request.pose_image)
+                pose_data = base64.b64decode(encoded_p)
+                p_nparr = np.frombuffer(pose_data, np.uint8)
+                pose_source = cv2.imdecode(p_nparr, cv2.IMREAD_COLOR)
+                pose_pil = Image.fromarray(cv2.cvtColor(pose_source, cv2.COLOR_BGR2RGB))
+                
+                # OpenPose で骨格検出
+                pose_map = detector(pose_pil)
+                control_scale = 1.0
+                print("Pose extracted for ControlNet")
+            except Exception as e:
+                print(f"Error processing pose image: {e}")
+                traceback.print_exc()
+        
+        # ControlNet用のダミー画像（ポーズがない場合）
+        if pose_map is None:
+            pose_map = Image.new("RGB", (request.width, request.height), (0, 0, 0))
+            control_scale = 0.0
+
         # パラメータを指定して生成
         generate_kwargs = {
             "prompt": final_prompt,
@@ -218,12 +279,14 @@ async def generate(request: GenerateRequest):
             "num_inference_steps": request.num_inference_steps,
             "width": request.width,
             "height": request.height,
-            "generator": generator
+            "generator": generator,
+            "image": pose_map, # ControlNet Conditioning Image
+            "controlnet_conditioning_scale": control_scale
         }
         
         if ip_adapter_image:
             # Standard IP-Adapter は画像をリスト形式で受け取ります
-            pipe.set_ip_adapter_scale(0.7)
+            pipe.set_ip_adapter_scale(request.face_strength)
             generate_kwargs["ip_adapter_image"] = [ip_adapter_image]
         else:
             # 顔指定がない場合はスケールを0にして無効化
