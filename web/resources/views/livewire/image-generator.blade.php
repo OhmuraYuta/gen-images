@@ -1,12 +1,15 @@
 <?php
 
 use Livewire\Volt\Component;
+use Livewire\WithFileUploads;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
 new class extends Component
 {
+    use WithFileUploads;
+
     public string $prompt = '';
     public string $negativePrompt = 'ugly, deformed, disfigured, poor quality, blurry, low res, bad anatomy, bad hands, text, error, missing fingers, bad legs,';
     public float $guidanceScale = 7.5;
@@ -21,6 +24,22 @@ new class extends Component
     public bool $isGenerating = false;
     public bool $showSettings = false;
     public string $error = '';
+    
+    // Face ID
+    public $faceImage;
+    public ?string $faceImageBase64 = null;
+
+    public function updatedFaceImage()
+    {
+        $this->validate(['faceImage' => 'image|max:5120']);
+        $this->faceImageBase64 = 'data:image/png;base64,' . base64_encode(file_get_contents($this->faceImage->getRealPath()));
+    }
+
+    public function clearFaceImage()
+    {
+        $this->faceImage = null;
+        $this->faceImageBase64 = null;
+    }
 
     public function generate()
     {
@@ -47,6 +66,7 @@ new class extends Component
                 'width' => $this->width,
                 'height' => $this->height,
                 'seed' => $this->isRandomSeed ? -1 : $this->seed,
+                'face_image' => $this->faceImageBase64,
             ]);
 
             if ($response->successful()) {
@@ -99,15 +119,51 @@ new class extends Component
         </div>
 
         <div class="p-8 glass rounded-2xl shadow-2xl space-y-6">
-            <div class="flex items-center justify-between mb-2">
-                <label for="prompt" class="block text-sm font-medium text-[#1b1b18] dark:text-[#EDEDEC]">プロンプト</label>
-                <button wire:click="toggleSettings" class="text-xs font-medium text-[#f53003] hover:underline flex items-center gap-1">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 12h7.5" />
-                    </svg>
-                    こだわり設定
-                </button>
+        <div class="flex items-center justify-between mb-2">
+            <label for="prompt" class="block text-sm font-medium text-[#1b1b18] dark:text-[#EDEDEC]">プロンプト</label>
+            <button wire:click="toggleSettings" class="text-xs font-medium text-[#f53003] hover:underline flex items-center gap-1">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 12h7.5" />
+                </svg>
+                こだわり設定
+            </button>
+        </div>
+
+        <!-- Face ID Upload Area -->
+        <div class="mb-4">
+            <div class="relative group cursor-pointer border-2 border-dashed border-[#19140020] dark:border-[#3E3E3A50] rounded-xl hover:border-[#f53003] transition-all overflow-hidden bg-white/50 dark:bg-black/20">
+                @if($faceImageBase64)
+                    <div class="flex items-center gap-4 p-3 pr-10">
+                        <img src="{{ $faceImageBase64 }}" class="w-12 h-12 rounded-lg object-cover ring-2 ring-[#f53003]/20 shadow-sm">
+                        <div class="flex flex-col">
+                            <p class="text-[10px] font-bold uppercase tracking-wider text-[#f53003]">Face ID Active</p>
+                            <p class="text-xs opacity-60">この顔をベースに生成します</p>
+                        </div>
+                        <button wire:click="clearFaceImage" class="absolute right-3 top-3 p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors opacity-0 group-hover:opacity-100">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-3.5 h-3.5">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+                @else
+                    <label class="flex items-center gap-4 p-3 cursor-pointer">
+                        <input type="file" wire:model="faceImage" class="hidden" accept="image/*">
+                        <div class="w-12 h-12 rounded-lg bg-[#dbdbd7] dark:bg-[#161615] flex items-center justify-center border border-[#19140020]">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6 opacity-30">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M15.182 15.182a4.5 4.5 0 01-6.364 0M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9.75 9.75c0 .414-.168.75-.375.75S9 10.164 9 9.75 9.168 9 9.375 9s.375.336.375.75zm-.375 0h.008v.015h-.008V9.75zm5.625 0c0 .414-.168.75-.375.75s-.375-.336-.375-.75.168-.75.375-.75.375.336.375.75zm-.375 0h.008v.015h-.008V9.75z" />
+                            </svg>
+                        </div>
+                        <div class="flex flex-col">
+                            <p class="text-[10px] font-bold uppercase tracking-wider opacity-60">Face ID (同一人物生成)</p>
+                            <p class="text-xs opacity-40">お手本となる顔写真をアップロード</p>
+                        </div>
+                    </label>
+                @endif
+                <div wire:loading wire:target="faceImage" class="absolute inset-0 bg-white/80 dark:bg-black/80 flex items-center justify-center">
+                    <div class="w-4 h-4 border-2 border-[#f53003] border-t-transparent rounded-full animate-spin"></div>
+                </div>
             </div>
+        </div>
             
             <div class="flex gap-2">
                 <input 
@@ -202,6 +258,19 @@ new class extends Component
             @elseif($imagePath)
                 <!-- Success State -->
                 <img src="{{ $imagePath }}" alt="Generated Artifact" class="w-full h-full object-contain p-4 transition-all duration-500">
+                
+                @if($faceImageBase64)
+                    <div class="absolute top-8 left-8">
+                        <span class="bg-[#f53003] text-white text-[10px] font-bold px-3 py-1.5 rounded-full shadow-lg flex items-center gap-1.5 backdrop-blur-md ring-1 ring-white/20">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-3 h-3">
+                                <path fill-rule="evenodd" d="M18.685 19.097A9.723 9.723 0 0021.75 12c0-5.385-4.365-9.75-9.75-9.75S2.25 6.615 2.25 12c0 2.754 1.143 5.24 2.975 7.027A10.5 10.5 0 0112 18a10.511 10.511 0 016.685 1.097zm0 1.097a10.463 10.463 0 00-6.685-1.1c-2.317 0-4.484.75-6.237 2.016a1.125 1.125 0 001.2 1.905l.084-.053c1.474-.932 3.193-1.472 5.038-1.472a10.46 10.46 0 016.038 1.942l.084.053a1.125 1.125 0 001.2-1.905l.044-.029c-1.455-1.12-3.32-1.842-5.38-2.22z" clip-rule="evenodd" />
+                                <path fill-rule="evenodd" d="M12 15.75a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd" />
+                            </svg>
+                            FACE ID ACTIVE
+                        </span>
+                    </div>
+                @endif
+
                 <div class="absolute bottom-4 left-4 right-4 glass px-5 py-3 rounded-2xl border border-white/10 flex justify-between items-center group shadow-2xl">
                     <div class="overflow-hidden">
                         <p class="text-[10px] font-bold mb-0.5 uppercase tracking-widest opacity-40">Composition Result</p>

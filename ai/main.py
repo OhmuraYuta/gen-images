@@ -11,10 +11,17 @@ from google import genai
 from google.genai import types
 import io
 import re
-import time
-from PIL import Image
-from typing import Optional
+from typing import Optional, List
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+import base64
+import cv2
+import numpy as np
+import traceback
+from insightface.app import FaceAnalysis
+from insightface.utils import face_align
+from huggingface_hub import hf_hub_download
+from transformers import CLIPVisionModelWithProjection
+from PIL import Image
 
 app = FastAPI()
 
@@ -44,11 +51,62 @@ try:
         safety_checker=None,
         requires_safety_checker=False
     )
-    pipe = pipe.to(device)
+    # ここでの to(device) や enable_model_cpu_offload は削除し、
+    # すべてのコンポーネント（IP-Adapter等）をロードした後に設定します
 except Exception as e:
     print(f"Error loading model: {e}")
     pipe = None
     genai_client = None
+
+# InsightFace の初期化
+try:
+    print(f"Initializing InsightFace (cwd: {os.getcwd()})...")
+    # root='./' の場合、./models/antelopev2/*.onnx を見に行く
+    face_app = FaceAnalysis(name='antelopev2', root='./', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
+    print("InsightFace initialized successfully")
+except Exception as e:
+    print(f"Warning: Failed to initialize InsightFace: {e}")
+    traceback.print_exc()
+    face_app = None
+
+# IP-Adapter weights のロード
+try:
+    if pipe is not None:
+        # 1. Load CLIP Image Encoder (ViT-H - 1024 dim)
+        # BigG (1280 dim) は入手困難なため、より汎用的な ViT-H を使用し、
+        # 対応する weight の IP-Adapter をロードします
+        print("Loading CLIP Image Encoder (ViT-H)...")
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            "laion/CLIP-ViT-H-14-laion2B-s32B-b79K", 
+            torch_dtype=torch.float16
+        ).to(device)
+        
+        # Image Encoder をパイプラインに登録し、CPU Offload の管理対象にする
+        pipe.register_modules(image_encoder=image_encoder)
+
+        # 2. Load IP-Adapter for SDXL (ViT-H version)
+        # ViT-H エンコーダーに対応した重みを使用します
+        print("Loading IP-Adapter SDXL (ViT-H)...")
+        pipe.load_ip_adapter(
+            "h94/IP-Adapter", 
+            subfolder="sdxl_models", 
+            weight_name="ip-adapter_sdxl_vit-h.bin",
+            image_encoder=image_encoder
+        )
+        pipe.set_ip_adapter_scale(0.7)
+        print("IP-Adapter Standard SDXL loaded successfully")
+
+        # すべてのモジュールロード完了後に CPU Offload を有効化
+        if device == "cuda":
+            print("Enabling model CPU offload for memory optimization (Finalizing)...")
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(device)
+
+except Exception as e:
+    print(f"Warning: Failed to load IP-Adapter: {e}")
+    traceback.print_exc()
 
 def contains_japanese(text: str) -> bool:
     # 日本語文字が含まれているかチェック
@@ -62,6 +120,7 @@ class GenerateRequest(BaseModel):
     width: int = 1024
     height: int = 1024
     seed: Optional[int] = -1
+    face_image: Optional[str] = None # Base64 encoded image
 
 @app.get("/health")
 def health():
@@ -120,16 +179,59 @@ async def generate(request: GenerateRequest):
         
         generator = torch.Generator(device=device).manual_seed(used_seed)
 
+        # 顔画像が提供されている場合の処理
+        ip_adapter_image = None
+        id_embeds = None
+        if request.face_image and face_app is not None:
+            try:
+                # Base64デコード
+                header, encoded = request.face_image.split(",", 1) if "," in request.face_image else (None, request.face_image)
+                image_data = base64.b64decode(encoded)
+                nparr = np.frombuffer(image_data, np.uint8)
+                face_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                # 顔認識
+                faces = face_app.get(face_img)
+                if len(faces) > 0:
+                    # 最初の顔の特徴を使用 (最も大きい顔を選択)
+                    face_info = sorted(faces, key=lambda x:(x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)[0]
+                    # InsightFace の埋め込みベクトル (ID embeds)
+                    id_embeds = torch.from_numpy(face_info.normed_embedding).unsqueeze(0).to(device, dtype=torch.float16)
+                    
+                    # IP-Adapter (PlusV2) が必要とするリファレンス画像（切り抜き・リサイズ）
+                    # InsightFace の align を使って正規化された顔画像を取得
+                    aligned_face = face_align.norm_crop(face_img, landmark=face_info.kps, image_size=224)
+                    ip_adapter_image = Image.fromarray(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB))
+                    
+                    print("Face identified and embeddings extracted for FaceID")
+                else:
+                    print("No face detected in the provided image")
+            except Exception as e:
+                print(f"Error processing face image: {e}")
+                traceback.print_exc()
+
         # パラメータを指定して生成
-        image = pipe(
-            prompt=final_prompt,
-            negative_prompt=request.negative_prompt,
-            guidance_scale=request.guidance_scale,
-            num_inference_steps=request.num_inference_steps,
-            width=request.width,
-            height=request.height,
-            generator=generator
-        ).images[0]
+        generate_kwargs = {
+            "prompt": final_prompt,
+            "negative_prompt": request.negative_prompt,
+            "guidance_scale": request.guidance_scale,
+            "num_inference_steps": request.num_inference_steps,
+            "width": request.width,
+            "height": request.height,
+            "generator": generator
+        }
+        
+        if ip_adapter_image:
+            # Standard IP-Adapter は画像をリスト形式で受け取ります
+            pipe.set_ip_adapter_scale(0.7)
+            generate_kwargs["ip_adapter_image"] = [ip_adapter_image]
+        else:
+            # 顔指定がない場合はスケールを0にして無効化
+            # 制約を満たすためダミー画像（黒）を渡す
+            pipe.set_ip_adapter_scale(0.0)
+            generate_kwargs["ip_adapter_image"] = [Image.new("RGB", (224, 224), (0, 0, 0))]
+
+        image = pipe(**generate_kwargs).images[0]
         
         # 画像をメモリ上のバイト列に変換
         buf = io.BytesIO()
@@ -146,6 +248,7 @@ async def generate(request: GenerateRequest):
         return Response(content=byte_im, media_type="image/png", headers=headers)
     
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- 学習関連の機能 ---
