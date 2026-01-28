@@ -1,0 +1,10 @@
+.env
+web/.env
+ai/.venv
+ai/__pycache__/
+shared/images/*
+!shared/images/.gitkeep
+web/node_modules
+web/vendor
+web/public/storage
+ai/outputs/

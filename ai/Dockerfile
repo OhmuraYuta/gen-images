@@ -17,7 +17,7 @@ WORKDIR /app
 
 # 依存関係のインストール
 COPY pyproject.toml poetry.lock* ./
-RUN poetry install --no-interaction --no-ansi
+RUN poetry install --no-interaction --no-ansi --no-root
 
 COPY . .
 

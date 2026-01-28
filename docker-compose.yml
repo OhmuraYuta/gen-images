@@ -4,12 +4,13 @@ services:
       context: ./web
       dockerfile: ../docker/web/Dockerfile
     ports:
-      - "8000:80"
+      - "8002:80"
     volumes:
       - ./web:/var/www/html
       - ./shared/images:/var/www/html/storage/app/public/generated
     environment:
       - APP_ENV=local
+      - APP_URL=http://100.103.177.31:8002
       - APP_KEY=base64:$(php artisan key:generate --show)
       - AI_ENGINE_URL=http://ai:8000
     depends_on:
@@ -19,17 +20,19 @@ services:
     build:
       context: ./ai
     ports:
-      - "8080:8000"
+      - "8082:8000"
     volumes:
       - ./ai:/app
       - ./shared/images:/app/outputs
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
 networks:
   default:
