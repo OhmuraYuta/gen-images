@@ -353,6 +353,14 @@ new class extends Component
                     <div class="overflow-hidden">
                         <p class="text-[10px] font-bold mb-0.5 uppercase tracking-widest opacity-40">Composition Result</p>
                         <p class="text-sm font-medium truncate">✨ {{ Str::limit($prompt, 30) }}</p>
+                        @if($translatedPrompt)
+                            <div class="flex items-center gap-1.5 mt-1 text-xs text-white/50 overflow-hidden">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3 h-3 flex-shrink-0">
+                                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM4.332 8.668a.75.75 0 011.085 0l3 3a.75.75 0 001.086 0l5.167-5.167a.75.75 0 011.06 1.06l-5.698 5.698a1.75 1.75 0 01-2.474 0l-3.53-3.53a.75.75 0 010-1.06z" clip-rule="evenodd" />
+                                </svg>
+                                <span class="truncate">EN: {{ Str::limit($translatedPrompt, 40) }}</span>
+                            </div>
+                        @endif
                     </div>
                     <div class="flex items-center gap-3">
                         <div class="h-8 w-[1px] bg-white/10"></div>

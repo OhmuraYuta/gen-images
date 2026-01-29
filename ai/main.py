@@ -46,6 +46,7 @@ try:
     if gemini_api_key:
         genai_client = genai.Client(api_key=gemini_api_key)
         print("Gemini API client initialized")
+    else:
         genai_client = None
         print("Warning: GEMINI_API_KEY not found. Gemini-based translation will be unavailable.")
 
@@ -244,32 +245,63 @@ async def generate(request: GenerateRequest):
                 traceback.print_exc()
 
         # ポーズ画像の処理
-        pose_map = None
+        # デフォルトはControlNet無効化状態（黒画像 & scale 0.0）
+        pose_condition_image = Image.new("RGB", (request.width, request.height), (0, 0, 0))
         control_scale = 0.0
-        # Lazy Load function call
+        
+        # Lazy Load OpenPose
         detector = get_openpose()
         
         if request.pose_image and detector is not None:
             try:
+                print(f"Pose image received. Length: {len(request.pose_image)}")
                 # Base64デコード
-                header_p, encoded_p = request.pose_image.split(",", 1) if "," in request.pose_image else (None, request.pose_image)
-                pose_data = base64.b64decode(encoded_p)
-                p_nparr = np.frombuffer(pose_data, np.uint8)
-                pose_source = cv2.imdecode(p_nparr, cv2.IMREAD_COLOR)
-                pose_pil = Image.fromarray(cv2.cvtColor(pose_source, cv2.COLOR_BGR2RGB))
+                pose_image_bytes = base64.b64decode(request.pose_image.split(",")[1] if "," in request.pose_image else request.pose_image)
+                pose_image_np = np.frombuffer(pose_image_bytes, np.uint8)
+                pose_image_cv2 = cv2.imdecode(pose_image_np, cv2.IMREAD_COLOR)
                 
-                # OpenPose で骨格検出
-                pose_map = detector(pose_pil)
+                # BGR -> RGB & PIL変換
+                pose_image_pil = Image.fromarray(cv2.cvtColor(pose_image_cv2, cv2.COLOR_BGR2RGB))
+                
+                # 骨格抽出
+                print("Running OpenPose detector...")
+                pose_image = detector(pose_image_pil, detect_resolution=1024, image_resolution=1024)
+                print(f"Pose extracted successfully. Size: {pose_image.size}")
+                
+                # 生成サイズに合わせてアスペクト比維持リサイズ（Letterbox）
+                target_w, target_h = request.width, request.height
+                src_w, src_h = pose_image.size
+                
+                # スケール計算
+                scale = min(target_w / src_w, target_h / src_h)
+                new_w = int(src_w * scale)
+                new_h = int(src_h * scale)
+                
+                # リサイズ
+                pose_image_resized = pose_image.resize((new_w, new_h), Image.LANCZOS)
+                
+                # 黒背景のキャンバスを作成して中央に配置
+                final_pose_image = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+                paste_x = (target_w - new_w) // 2
+                paste_y = (target_h - new_h) // 2
+                final_pose_image.paste(pose_image_resized, (paste_x, paste_y))
+                
+                pose_image = final_pose_image
+                print(f"Pose resized with padding: {pose_image.size} (content: {new_w}x{new_h})")
+
+                # デバッグ用にポーズ画像を保存
+                os.makedirs("outputs", exist_ok=True)
+                pose_image.save("outputs/last_pose.png")
+                
+                # 変数を更新
+                pose_condition_image = pose_image
                 control_scale = 1.0
-                print("Pose extracted for ControlNet")
+                print("ControlNet enabled with scale 1.0")
+
             except Exception as e:
                 print(f"Error processing pose image: {e}")
                 traceback.print_exc()
-        
-        # ControlNet用のダミー画像（ポーズがない場合）
-        if pose_map is None:
-            pose_map = Image.new("RGB", (request.width, request.height), (0, 0, 0))
-            control_scale = 0.0
+                # エラー時はデフォルト（無効）のまま進む
 
         # パラメータを指定して生成
         generate_kwargs = {
@@ -280,7 +312,7 @@ async def generate(request: GenerateRequest):
             "width": request.width,
             "height": request.height,
             "generator": generator,
-            "image": pose_map, # ControlNet Conditioning Image
+            "image": pose_condition_image, # ControlNet Conditioning Image
             "controlnet_conditioning_scale": control_scale
         }
         
