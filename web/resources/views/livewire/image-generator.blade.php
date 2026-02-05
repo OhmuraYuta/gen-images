@@ -22,6 +22,7 @@ new class extends Component
     public string $imagePath = '';
     public string $translatedPrompt = '';
     public bool $isGenerating = false;
+    public bool $isSwapping = false;
     public bool $showSettings = false;
     public string $error = '';
     
@@ -45,6 +46,7 @@ new class extends Component
     // Pose Control
     public $poseImage;
     public ?string $poseImageBase64 = null;
+    public float $poseStrength = 1.0;
 
     public function updatedPoseImage()
     {
@@ -86,6 +88,7 @@ new class extends Component
                 'face_image' => $this->faceImageBase64,
                 'face_strength' => $this->faceStrength,
                 'pose_image' => $this->poseImageBase64,
+                'pose_strength' => $this->poseStrength,
             ]);
 
             if ($response->successful()) {
@@ -105,6 +108,37 @@ new class extends Component
         }
 
         $this->isGenerating = false;
+    }
+
+    public function faceSwap()
+    {
+        if (!$this->imagePath || !$this->faceImageBase64) {
+            $this->error = 'フェイススワップを実行するには、生成された画像と顔画像の両方が必要です。';
+            return;
+        }
+
+        $this->isSwapping = true;
+        try {
+            // 現在の生成画像をBase64として取得（Storageから読み込む）
+            $targetImageContent = Storage::disk('public')->get('generated/latest.png');
+            $targetImageBase64 = 'data:image/png;base64,' . base64_encode($targetImageContent);
+
+            $response = Http::timeout(120)->post(env('AI_ENGINE_URL', 'http://ai:8000') . '/face-swap', [
+                'target_image' => $targetImageBase64,
+                'source_image' => $this->faceImageBase64,
+            ]);
+
+            if ($response->successful()) {
+                $filename = 'generated/latest.png'; // 上書き
+                Storage::disk('public')->put($filename, $response->body());
+                $this->imagePath = Storage::url($filename) . '?t=' . time();
+            } else {
+                $this->error = 'フェイススワップ中にエラーが発生しました。: ' . $response->body();
+            }
+        } catch (\Exception $e) {
+            $this->error = 'フェイススワップ処理に失敗しました: ' . $e->getMessage();
+        }
+        $this->isSwapping = false;
     }
 
     public function toggleSettings()
@@ -241,6 +275,21 @@ new class extends Component
                     <div class="w-4 h-4 border-2 border-[#f53003] border-t-transparent rounded-full animate-spin"></div>
                 </div>
             </div>
+
+            @if($poseImageBase64)
+                <div class="mt-2 pt-4 border-t border-[#19140010] dark:border-[#3E3E3A50]">
+                    <div class="flex items-center justify-between mb-2">
+                        <label class="text-xs font-bold uppercase tracking-wider opacity-60">Pose Strength ({{ $poseStrength }})</label>
+                    </div>
+                    <div>
+                        <input type="range" wire:model.live="poseStrength" min="0.0" max="1.0" step="0.05" class="w-full accent-[#f53003]">
+                        <div class="flex justify-between text-[10px] opacity-40 mt-1">
+                            <span>Subtle</span>
+                            <span>Strong</span>
+                        </div>
+                    </div>
+                </div>
+            @endif
         </div>
             
             <div class="flex gap-2">
@@ -363,6 +412,15 @@ new class extends Component
                         @endif
                     </div>
                     <div class="flex items-center gap-3">
+                        @if($faceImageBase64)
+                            <button wire:click="faceSwap" wire:loading.attr="disabled" class="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-[#f53003] rounded-xl transition-all active:scale-95 group/swp disabled:opacity-50">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4" wire:loading.remove wire:target="faceSwap">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 7.5L21 9.5M21 9.5L19 11.5M21 9.5H13M5 16.5L3 14.5M3 14.5L5 12.5M3 14.5H11" />
+                                </svg>
+                                <div wire:loading wire:target="faceSwap" class="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                                <span class="text-xs font-bold uppercase tracking-wider">Face Swap</span>
+                            </button>
+                        @endif
                         <div class="h-8 w-[1px] bg-white/10"></div>
                         <a href="{{ $imagePath }}" download class="p-2.5 bg-white/10 hover:bg-[#f53003] rounded-xl transition-all active:scale-90 group/btn">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-5 h-5 transition-transform group-hover/btn:-translate-y-0.5">

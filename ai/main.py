@@ -32,6 +32,8 @@ pipe = None
 genai_client = None
 face_app = None
 openpose_detector = None # Lazy load
+loaded_lora_mtime = 0 # Timestamp of loaded LoRA
+face_swapper = None # Lazy load Face Swap model
 
 # モデルのロード
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -61,6 +63,22 @@ try:
                 print(f"Error loading OpenPose: {e}")
                 return None
         return openpose_detector
+    
+    # Lazy Load Face Swapper
+    def get_swapper():
+        global face_swapper
+        if face_swapper is None:
+            print("Initializing Face Swapper (inswapper_128)...")
+            try:
+                # insightface の model_zoo からロード
+                import insightface
+                model_path = hf_hub_download(repo_id="ezioruan/inswapper_128.onnx", filename="inswapper_128.onnx")
+                face_swapper = insightface.model_zoo.get_model(model_path, download=False, preview=False)
+            except Exception as e:
+                print(f"Error loading Face Swapper: {e}")
+                traceback.print_exc()
+                return None
+        return face_swapper
 
     # ControlNet OpenPose のロード
     print("Loading ControlNet OpenPose (SDXL)...")
@@ -155,6 +173,11 @@ class GenerateRequest(BaseModel):
     face_image: Optional[str] = None # Base64 encoded image
     face_strength: float = 0.7 # IP-Adapter scale (0.0 - 1.0)
     pose_image: Optional[str] = None # Base64 encoded pose reference image
+    pose_strength: float = 1.0 # ControlNet scale (0.0 - 1.0)
+
+class FaceSwapRequest(BaseModel):
+    target_image: str # Base64 encoded image (the one to be changed)
+    source_image: str # Base64 encoded image (the face to use)
 
 @app.get("/health")
 def health():
@@ -164,7 +187,46 @@ def health():
 async def generate(request: GenerateRequest):
     if pipe is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
+
+    # --- LoRA Dynamic Loading ---
+    global loaded_lora_mtime
     
+    try:
+        lora_file = None
+        # ディレクトリ内のsafetensorsを探す (pytorch_lora_weights.safetensors)
+        if os.path.exists(TRAIN_OUTPUT_DIR):
+            for f in os.listdir(TRAIN_OUTPUT_DIR):
+                if f.endswith(".safetensors"):
+                    lora_file = os.path.join(TRAIN_OUTPUT_DIR, f)
+                    break
+        
+        if lora_file and os.path.exists(lora_file):
+            current_mtime = os.path.getmtime(lora_file)
+            
+            # まだロードしていない、または更新された場合
+            if current_mtime > loaded_lora_mtime:
+                print(f"New LoRA model detected: {lora_file} (mtime: {current_mtime})")
+                print("Reloading LoRA weights...")
+                
+                try:
+                    # 既にロードされている場合はアンロード（重複適用防止）
+                    if loaded_lora_mtime > 0:
+                        pipe.unload_lora_weights()
+                    
+                    # LoRAロード
+                    pipe.load_lora_weights(lora_file)
+                    print("LoRA loaded successfully!")
+                    loaded_lora_mtime = current_mtime
+                    
+                except Exception as e:
+                    print(f"Error loading LoRA: {e}")
+                    # ロード失敗しても生成は続行できるよう、mtimeは更新しないでおく（またはエラー済みとしてマークするか）
+                    # 今回は次回リトライさせるためにmtime更新しない
+        
+    except Exception as e:
+        print(f"Error checking LoRA updates: {e}")
+    # ---------------------------
+
     try:
         # 日本語が含まれている場合は翻訳
         final_prompt = request.prompt
@@ -295,8 +357,8 @@ async def generate(request: GenerateRequest):
                 
                 # 変数を更新
                 pose_condition_image = pose_image
-                control_scale = 1.0
-                print("ControlNet enabled with scale 1.0")
+                control_scale = request.pose_strength
+                print(f"ControlNet enabled with scale {control_scale}")
 
             except Exception as e:
                 print(f"Error processing pose image: {e}")
@@ -416,7 +478,62 @@ async def training_status():
         log_content = f.readlines()
         last_lines = log_content[-5:] if log_content else []
         
+    last_log_str = "".join(last_lines)
+    
+    if "Training finished" in last_log_str:
+        status = "finished/error"
+    elif "Steps" in last_log_str:
+        status = "running"
+    else:
+        status = "finished/error"
+
     return {
-        "status": "running" if "Steps" in "".join(last_lines) else "finished/error",
+        "status": status,
         "last_log": last_lines
     }
+
+@app.post("/face-swap")
+async def face_swap(request: FaceSwapRequest):
+    swapper = get_swapper()
+    if swapper is None or face_app is None:
+        raise HTTPException(status_code=500, detail="Face Swapper or Analysis model not loaded")
+    
+    try:
+        # Base64デコード (Target)
+        target_data = base64.b64decode(request.target_image.split(",", 1)[1] if "," in request.target_image else request.target_image)
+        target_img = cv2.imdecode(np.frombuffer(target_data, np.uint8), cv2.IMREAD_COLOR)
+        
+        # Base64デコード (Source/Face)
+        source_data = base64.b64decode(request.source_image.split(",", 1)[1] if "," in request.source_image else request.source_image)
+        source_img = cv2.imdecode(np.frombuffer(source_data, np.uint8), cv2.IMREAD_COLOR)
+
+        # 顔検出 (Target & Source)
+        target_faces = face_app.get(target_img)
+        source_faces = face_app.get(source_img)
+
+        if not target_faces:
+             raise HTTPException(status_code=400, detail="No face detected in target image")
+        if not source_faces:
+             raise HTTPException(status_code=400, detail="No face detected in source image")
+
+        # ターゲット画像で最も大きい顔を選択
+        target_face = sorted(target_faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)[0]
+        # ソース画像で最も大きい顔を選択
+        source_face = sorted(source_faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)[0]
+
+        # フェイススワップ実行
+        print("Performing Face Swap...")
+        result_img = swapper.get(target_img, target_face, source_face, paste_back=True)
+        
+        # エンコードして返却
+        _, buffer = cv2.imencode(".png", result_img)
+        return Response(content=buffer.tobytes(), media_type="image/png")
+
+    except Exception as e:
+        print(f"Face Swap error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

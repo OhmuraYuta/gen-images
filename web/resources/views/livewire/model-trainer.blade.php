@@ -111,13 +111,21 @@ new class extends Component
                     <div>
                         <label class="block text-sm font-medium text-gray-400 mb-2">学習画像 (10-20枚推奨)</label>
                         <div 
-                            class="relative border-2 border-dashed border-white/10 rounded-2xl p-8 transition-all hover:border-blue-500/50 group cursor-pointer"
+                            class="relative border-2 border-dashed rounded-2xl p-8 transition-all group cursor-pointer"
+                            :class="{ 'border-blue-500 bg-blue-500/10': isDropping, 'border-white/10 hover:border-blue-500/50': !isDropping }"
+                            x-data="{ isDropping: false }"
+                            x-on:dragover.prevent="isDropping = true"
+                            x-on:dragleave.prevent="isDropping = false"
+                            x-on:drop.prevent="
+                                isDropping = false;
+                                $wire.uploadMultiple('images', $event.dataTransfer.files);
+                            "
                             x-on:click="$refs.fileInput.click()"
                         >
-                            <input type="file" wire:model="images" multiple class="hidden" x-ref.fileInput>
+                            <input type="file" wire:model="images" multiple class="hidden" x-ref="fileInput">
                             <div class="text-center">
                                 <span class="text-3xl mb-2 block">📸</span>
-                                <p class="text-sm text-gray-400 group-hover:text-gray-300">クリックして画像を選択</p>
+                                <p class="text-sm text-gray-400 group-hover:text-gray-300">画像をここにドロップ<br>またはクリックして選択</p>
                                 <p class="text-xs text-gray-500 mt-1">PNG, JPG (512x512以上推奨)</p>
                             </div>
                         </div>
