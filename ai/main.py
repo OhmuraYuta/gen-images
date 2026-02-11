@@ -34,6 +34,7 @@ face_app = None
 openpose_detector = None # Lazy load
 loaded_lora_mtime = 0 # Timestamp of loaded LoRA
 face_swapper = None # Lazy load Face Swap model
+ip_adapter_loaded = False # IP-Adapter lazy load flag
 
 # モデル設定
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -43,7 +44,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 def load_model():
-    global pipe, genai_client, controlnet, loaded_lora_mtime
+    global pipe, genai_client, controlnet, loaded_lora_mtime, ip_adapter_loaded
     
     print(f"Loading models on device: {device}...")
     
@@ -78,39 +79,18 @@ def load_model():
             requires_safety_checker=False
         )
         
-        # IP-Adapter (Standard) のロード
-        try:
-            print("Loading CLIP Image Encoder (Standard)...")
-            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                "h94/IP-Adapter",
-                subfolder="models/image_encoder", 
-                torch_dtype=torch.float16
-            ).to(device)
-            
-            print("Loading IP-Adapter weights...")
-            # Use standard version (not Plus) to avoid dimension mismatch issues
-            pipe.load_ip_adapter(
-                "h94/IP-Adapter", 
-                subfolder="sdxl_models", 
-                weight_name="ip-adapter_sdxl.bin",
-                image_encoder=image_encoder
-            )
-            print("IP-Adapter loaded successfully")
-        except Exception as e:
-             print(f"Warning: Failed to load IP-Adapter inside load_model: {e}")
-             traceback.print_exc()
+        # IP-Adapter は顔画像提供時にのみ遅延ロードする（tupleエラー回避のため）
+        ip_adapter_loaded = False
+        print("IP-Adapter will be loaded on-demand when face image is provided")
 
-        # すべてのモジュールロード完了後にCPU Offloadを有効化（GPU常駐は12GBでは不安定）
-        if device == "cuda":
-            print("Enabling model CPU offload for memory optimization...")
-            pipe.enable_model_cpu_offload()
-            
-            # 追加の最適化でVRAM使用量を削減し、速度もわずかに改善
-            pipe.enable_vae_tiling()
-            pipe.enable_attention_slicing(slice_size="auto")
-            print("Enabled VAE tiling and attention slicing")
-        else:
-            pipe = pipe.to(device)
+        # GPU常駐モード（IP-Adapter未ロードのためVRAMに収まる）
+        print("Moving pipeline to GPU...")
+        pipe = pipe.to(device)
+        
+        # VRAM節約の最適化
+        pipe.enable_vae_tiling()
+        pipe.enable_attention_slicing(slice_size="auto")
+        print("Enabled VAE tiling and attention slicing")
 
         # Reset Loaded LoRA tracking
         loaded_lora_mtime = 0
@@ -197,43 +177,57 @@ async def generate(request: GenerateRequest):
     if pipe is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
-    # --- LoRA Dynamic Loading ---
+    # --- トリガーワード検出時のLoRAロード ---
+    # トリガーワード: "ohms"
+    trigger_word = "ohms"
+    lora_should_be_loaded = trigger_word in request.prompt.lower()
+    
     global loaded_lora_mtime
     
     try:
+        # LoRAファイルの存在確認
         lora_file = None
-        # ディレクトリ内のsafetensorsを探す (pytorch_lora_weights.safetensors)
         if os.path.exists(TRAIN_OUTPUT_DIR):
             for f in os.listdir(TRAIN_OUTPUT_DIR):
                 if f.endswith(".safetensors"):
                     lora_file = os.path.join(TRAIN_OUTPUT_DIR, f)
                     break
         
-        if lora_file and os.path.exists(lora_file):
+        # トリガーワードが含まれている場合のみLoRAをロード
+        if lora_should_be_loaded and lora_file and os.path.exists(lora_file):
             current_mtime = os.path.getmtime(lora_file)
             
             # まだロードしていない、または更新された場合
             if current_mtime > loaded_lora_mtime:
-                print(f"New LoRA model detected: {lora_file} (mtime: {current_mtime})")
-                print("Reloading LoRA weights...")
+                print(f"Trigger word '{trigger_word}' detected. Loading LoRA: {lora_file}")
                 
                 try:
-                    # 既にロードされている場合はアンロード（重複適用防止）
+                    # 既にロードされている場合はアンロード
                     if loaded_lora_mtime > 0:
                         pipe.unload_lora_weights()
                     
-                    # LoRAロード
-                    pipe.load_lora_weights(lora_file)
+                    # LoRAロード（ディレクトリとファイル名を分けて指定）
+                    pipe.load_lora_weights(TRAIN_OUTPUT_DIR, weight_name="pytorch_lora_weights.safetensors")
                     print("LoRA loaded successfully!")
                     loaded_lora_mtime = current_mtime
                     
                 except Exception as e:
                     print(f"Error loading LoRA: {e}")
-                    # ロード失敗しても生成は続行できるよう、mtimeは更新しないでおく（またはエラー済みとしてマークするか）
-                    # 今回は次回リトライさせるためにmtime更新しない
+                    traceback.print_exc()
+        
+        # トリガーワードがない場合、LoRAがロードされていればアンロード
+        elif not lora_should_be_loaded and loaded_lora_mtime > 0:
+            print(f"Trigger word '{trigger_word}' not found. Unloading LoRA...")
+            try:
+                pipe.unload_lora_weights()
+                loaded_lora_mtime = 0
+                print("LoRA unloaded successfully!")
+            except Exception as e:
+                print(f"Error unloading LoRA: {e}")
         
     except Exception as e:
-        print(f"Error checking LoRA updates: {e}")
+        print(f"Error in LoRA trigger detection: {e}")
+        traceback.print_exc()
     # ---------------------------
 
     try:
@@ -282,8 +276,7 @@ async def generate(request: GenerateRequest):
         if used_seed is None or used_seed < 0:
             used_seed = torch.seed() % (2**32) 
         
-        # CPU Offload使用時はgeneratorもCPUで作成
-        generator = torch.Generator(device="cpu").manual_seed(used_seed)
+        generator = torch.Generator(device=device).manual_seed(used_seed)
 
         # 顔画像が提供されている場合の処理
         ip_adapter_image = None
@@ -389,23 +382,35 @@ async def generate(request: GenerateRequest):
         }
         
         if ip_adapter_image:
-            # DEBUG: Check image encoder size before generation
-            try:
-                if hasattr(pipe, "image_encoder") and pipe.image_encoder is not None:
-                     print(f"DEBUG IN GENERATE: Pipe Image Encoder Hidden Size: {pipe.image_encoder.config.hidden_size}")
-                else:
-                     print("DEBUG IN GENERATE: Pipe has no image_encoder attribute or is None")
-            except Exception as e:
-                print(f"DEBUG IN GENERATE Error checking encoder: {e}")
-
-            # Standard IP-Adapter は画像をリスト形式で受け取ります
-            pipe.set_ip_adapter_scale(request.face_strength)
-            generate_kwargs["ip_adapter_image"] = [ip_adapter_image]
-        else:
-            # 顔指定がない場合はスケールを0にして無効化
-            # 制約を満たすためダミー画像（黒）を渡す
-            pipe.set_ip_adapter_scale(0.0)
-            generate_kwargs["ip_adapter_image"] = [Image.new("RGB", (224, 224), (0, 0, 0))]
+            global ip_adapter_loaded
+            
+            # IP-Adapterがまだロードされていなければ遅延ロード
+            if not ip_adapter_loaded:
+                try:
+                    print("Lazy loading IP-Adapter...")
+                    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                        "h94/IP-Adapter",
+                        subfolder="models/image_encoder", 
+                        torch_dtype=torch.float16
+                    ).to(device)
+                    
+                    pipe.load_ip_adapter(
+                        "h94/IP-Adapter", 
+                        subfolder="sdxl_models", 
+                        weight_name="ip-adapter_sdxl.bin",
+                        image_encoder=image_encoder
+                    )
+                    ip_adapter_loaded = True
+                    print("IP-Adapter loaded successfully (lazy)")
+                except Exception as e:
+                    print(f"Error loading IP-Adapter: {e}")
+                    traceback.print_exc()
+            
+            if ip_adapter_loaded:
+                pipe.set_ip_adapter_scale(request.face_strength)
+                generate_kwargs["ip_adapter_image"] = [ip_adapter_image]
+                print(f"Using IP-Adapter with face_strength: {request.face_strength}")
+        # 顔指定がない場合は、IP-Adapterを使わずに生成（tupleエラー回避）
 
         image = pipe(**generate_kwargs).images[0]
         

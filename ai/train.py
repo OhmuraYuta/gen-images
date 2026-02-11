@@ -364,28 +364,12 @@ def main():
         print("Training finished! Saving LoRA weights...")
         
         # Unwrap and save adapter
-        # Unwrap model
         unet = accelerator.unwrap_model(unet)
         
-        # Save ONLY LoRA weights (filtering by "lora" in key)
-        # We need to prepend "unet." prefix so that pipe.load_lora_weights identifies them correctly
-        unet_lora_state_dict = {f"unet.{k}": v for k, v in unet.state_dict().items() if "lora" in k}
-        
-        from safetensors.torch import save_file
-        save_path = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
-        save_file(unet_lora_state_dict, save_path)
-        print(f"Saved LoRA weights to {save_path}")
-        
-        # We need "pytorch_lora_weights.safetensors" for our loading logic in main.py?
-        # main.py looks for ANY .safetensors. PEFT standard is `adapter_model.safetensors`
-        # Let's ensure we return a safetensors file.
-        
-        # Post-processing: Rename or ensure main.py finds it.
-        # main.py: "if f.endswith('.safetensors')"
-        # save_pretrained usually saves `adapter_model.safetensors` if safe_serialization=True is default or passed.
-        # It seems PEFT defualts to .bin (PyTorch) sometimes.
-        # Force safetensors or just rename.
-        pass
+        # PEFTの save_attn_procs で保存（diffusers load_lora_weights と互換性あり）
+        unet.save_attn_procs(args.output_dir, safe_serialization=True)
+        print(f"Saved LoRA weights to {args.output_dir}")
+
 
 if __name__ == "__main__":
     main()
