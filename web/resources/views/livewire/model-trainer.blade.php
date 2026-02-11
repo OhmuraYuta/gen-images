@@ -10,7 +10,7 @@ new class extends Component
 
     public $images = [];
     public string $instancePrompt = '';
-    public int $maxTrainSteps = 800;
+    public int $maxTrainSteps = 200;
     public float $learningRate = 0.0001;
     
     public string $status = 'idle'; 
@@ -80,7 +80,7 @@ new class extends Component
                 if ($data['status'] === 'finished/error' && !empty($this->logs)) {
                     // ログの最後の方を見て成功か失敗か判断（簡易的）
                     $lastLog = implode('', $this->logs);
-                    if (str_contains($lastLog, 'Steps: 100%')) {
+                    if (str_contains($lastLog, 'Steps: 100%') || str_contains($lastLog, 'Training finished')) {
                         $this->status = 'finished';
                         $this->message = '学習が正常に完了しました！🎉';
                         $this->isCheckingStatus = false;

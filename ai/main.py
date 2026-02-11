@@ -35,78 +35,124 @@ openpose_detector = None # Lazy load
 loaded_lora_mtime = 0 # Timestamp of loaded LoRA
 face_swapper = None # Lazy load Face Swap model
 
-# モデルのロード
+# モデル設定
 model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 trans_model_id = "Helsinki-NLP/opus-mt-ja-en"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"Using device: {device}")
 
-try:
-    # Gemini Client の初期化
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if gemini_api_key:
-        genai_client = genai.Client(api_key=gemini_api_key)
-        print("Gemini API client initialized")
-    else:
-        genai_client = None
-        print("Warning: GEMINI_API_KEY not found. Gemini-based translation will be unavailable.")
-
-    # Lazy Load OpenPose
-    def get_openpose():
-        global openpose_detector
-        if openpose_detector is None:
-            print("Initializing OpenPose Detector (Lazy Load)...")
-            try:
-                openpose_detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-            except Exception as e:
-                print(f"Error loading OpenPose: {e}")
-                return None
-        return openpose_detector
+def load_model():
+    global pipe, genai_client, controlnet, loaded_lora_mtime
     
-    # Lazy Load Face Swapper
-    def get_swapper():
-        global face_swapper
-        if face_swapper is None:
-            print("Initializing Face Swapper (inswapper_128)...")
-            try:
-                # insightface の model_zoo からロード
-                import insightface
-                model_path = hf_hub_download(repo_id="ezioruan/inswapper_128.onnx", filename="inswapper_128.onnx")
-                face_swapper = insightface.model_zoo.get_model(model_path, download=False, preview=False)
-            except Exception as e:
-                print(f"Error loading Face Swapper: {e}")
-                traceback.print_exc()
-                return None
-        return face_swapper
+    print(f"Loading models on device: {device}...")
+    
+    try:
+        # Gemini Client の初期化
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if gemini_api_key:
+            genai_client = genai.Client(api_key=gemini_api_key)
+            print("Gemini API client initialized")
+        else:
+            genai_client = None
+            print("Warning: GEMINI_API_KEY not found. Gemini-based translation will be unavailable.")
 
-    # ControlNet OpenPose のロード
-    print("Loading ControlNet OpenPose (SDXL)...")
-    controlnet = ControlNetModel.from_pretrained(
-        "xinsir/controlnet-openpose-sdxl-1.0",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True
-    )
-    # controlnet = None
+        # ControlNet OpenPose のロード
+        print("Loading ControlNet OpenPose (SDXL)...")
+        controlnet = ControlNetModel.from_pretrained(
+            "xinsir/controlnet-openpose-sdxl-1.0",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
 
-    # SDXL Pipeline (ControlNet) をロード
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        model_id, 
-        controlnet=controlnet,
-        torch_dtype=torch.float16, 
-        variant="fp16", 
-        use_safetensors=True,
-        low_cpu_mem_usage=True,
-        safety_checker=None,
-        requires_safety_checker=False
-    )
-    # ここでの to(device) や enable_model_cpu_offload は削除し、
-    # すべてのコンポーネント（IP-Adapter等）をロードした後に設定します
-except Exception as e:
-    print(f"Error loading model: {e}")
-    pipe = None
-    controlnet = None
-    genai_client = None
+        # SDXL Pipeline (ControlNet) をロード
+        print("Loading SDXL Pipeline...")
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            model_id, 
+            controlnet=controlnet,
+            torch_dtype=torch.float16, 
+            variant="fp16", 
+            use_safetensors=True,
+            low_cpu_mem_usage=True,
+            safety_checker=None,
+            requires_safety_checker=False
+        )
+        
+        # IP-Adapter (Standard) のロード
+        try:
+            print("Loading CLIP Image Encoder (Standard)...")
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                "h94/IP-Adapter",
+                subfolder="models/image_encoder", 
+                torch_dtype=torch.float16
+            ).to(device)
+            
+            print("Loading IP-Adapter weights...")
+            # Use standard version (not Plus) to avoid dimension mismatch issues
+            pipe.load_ip_adapter(
+                "h94/IP-Adapter", 
+                subfolder="sdxl_models", 
+                weight_name="ip-adapter_sdxl.bin",
+                image_encoder=image_encoder
+            )
+            print("IP-Adapter loaded successfully")
+        except Exception as e:
+             print(f"Warning: Failed to load IP-Adapter inside load_model: {e}")
+             traceback.print_exc()
+
+        # すべてのモジュールロード完了後にCPU Offloadを有効化（GPU常駐は12GBでは不安定）
+        if device == "cuda":
+            print("Enabling model CPU offload for memory optimization...")
+            pipe.enable_model_cpu_offload()
+            
+            # 追加の最適化でVRAM使用量を削減し、速度もわずかに改善
+            pipe.enable_vae_tiling()
+            pipe.enable_attention_slicing(slice_size="auto")
+            print("Enabled VAE tiling and attention slicing")
+        else:
+            pipe = pipe.to(device)
+
+        # Reset Loaded LoRA tracking
+        loaded_lora_mtime = 0
+            
+        return True
+
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        traceback.print_exc()
+        pipe = None
+        controlnet = None
+        genai_client = None
+        return False
+
+# Lazy Load Helpers
+def get_openpose():
+    global openpose_detector
+    if openpose_detector is None:
+        print("Initializing OpenPose Detector (Lazy Load)...")
+        try:
+            openpose_detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+        except Exception as e:
+            print(f"Error loading OpenPose: {e}")
+            return None
+    return openpose_detector
+
+def get_swapper():
+    global face_swapper
+    if face_swapper is None:
+        print("Initializing Face Swapper (inswapper_128)...")
+        try:
+            import insightface
+            model_path = hf_hub_download(repo_id="ezioruan/inswapper_128.onnx", filename="inswapper_128.onnx")
+            face_swapper = insightface.model_zoo.get_model(model_path, download=False, preview=False)
+        except Exception as e:
+            print(f"Error loading Face Swapper: {e}")
+            traceback.print_exc()
+            return None
+    return face_swapper
+
+# 初回ロード
+load_model()
 
 # InsightFace の初期化
 try:
@@ -120,43 +166,6 @@ except Exception as e:
     traceback.print_exc()
     face_app = None
 
-# IP-Adapter weights のロード
-try:
-    if pipe is not None:
-        # 1. Load CLIP Image Encoder (ViT-H - 1024 dim)
-        # BigG (1280 dim) は入手困難なため、より汎用的な ViT-H を使用し、
-        # 対応する weight の IP-Adapter をロードします
-        print("Loading CLIP Image Encoder (ViT-H)...")
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            "laion/CLIP-ViT-H-14-laion2B-s32B-b79K", 
-            torch_dtype=torch.float16
-        ).to(device)
-        
-        # Image Encoder をパイプラインに登録し、CPU Offload の管理対象にする
-        pipe.register_modules(image_encoder=image_encoder, controlnet=controlnet)
-
-        # 2. Load IP-Adapter for SDXL (ViT-H version)
-        # ViT-H エンコーダーに対応した重みを使用します
-        print("Loading IP-Adapter SDXL (ViT-H)...")
-        pipe.load_ip_adapter(
-            "h94/IP-Adapter", 
-            subfolder="sdxl_models", 
-            weight_name="ip-adapter_sdxl_vit-h.bin",
-            image_encoder=image_encoder
-        )
-        pipe.set_ip_adapter_scale(0.7)
-        print("IP-Adapter Standard SDXL loaded successfully")
-
-        # すべてのモジュールロード完了後に CPU Offload を有効化
-        if device == "cuda":
-            print("Enabling model CPU offload for memory optimization (Finalizing)...")
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe = pipe.to(device)
-
-except Exception as e:
-    print(f"Warning: Failed to load IP-Adapter: {e}")
-    traceback.print_exc()
 
 def contains_japanese(text: str) -> bool:
     # 日本語文字が含まれているかチェック
@@ -273,7 +282,8 @@ async def generate(request: GenerateRequest):
         if used_seed is None or used_seed < 0:
             used_seed = torch.seed() % (2**32) 
         
-        generator = torch.Generator(device=device).manual_seed(used_seed)
+        # CPU Offload使用時はgeneratorもCPUで作成
+        generator = torch.Generator(device="cpu").manual_seed(used_seed)
 
         # 顔画像が提供されている場合の処理
         ip_adapter_image = None
@@ -379,6 +389,15 @@ async def generate(request: GenerateRequest):
         }
         
         if ip_adapter_image:
+            # DEBUG: Check image encoder size before generation
+            try:
+                if hasattr(pipe, "image_encoder") and pipe.image_encoder is not None:
+                     print(f"DEBUG IN GENERATE: Pipe Image Encoder Hidden Size: {pipe.image_encoder.config.hidden_size}")
+                else:
+                     print("DEBUG IN GENERATE: Pipe has no image_encoder attribute or is None")
+            except Exception as e:
+                print(f"DEBUG IN GENERATE Error checking encoder: {e}")
+
             # Standard IP-Adapter は画像をリスト形式で受け取ります
             pipe.set_ip_adapter_scale(request.face_strength)
             generate_kwargs["ip_adapter_image"] = [ip_adapter_image]
@@ -440,9 +459,19 @@ async def start_training(request: TrainRequest):
     # 非同期で学習を開始
     def run_training():
         # 推論用モデルを一旦メモリから逃がす（VRAM節約）
-        global pipe
-        temp_pipe = pipe
-        pipe = None
+        global pipe, controlnet
+        print("Unloading models for training...")
+        
+        # 明示的に削除してGCを実行
+        if pipe is not None:
+            del pipe
+            pipe = None
+        if controlnet is not None:
+            del controlnet
+            controlnet = None
+            
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         
         try:
@@ -459,10 +488,9 @@ async def start_training(request: TrainRequest):
                 process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
                 process.wait()
         finally:
-            # 推論用モデルを再ロード（または戻す）
-            pipe = temp_pipe
-            if pipe:
-                pipe.to(device)
+            # 推論用モデルを再ロード
+            print("Reloading models after training...")
+            load_model()
 
     thread = threading.Thread(target=run_training)
     thread.start()
